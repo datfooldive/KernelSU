@@ -1,0 +1,151 @@
+name: Build Manager (Spoofed Package)
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: "Application ID. Blank = random."
+        required: false
+        default: ""
+      app_name:
+        description: "App label. Blank = KernelSU."
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      package_name:
+        type: string
+        required: false
+        default: ""
+      app_name:
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build-manager-spoof:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./manager
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve package name and app name
+        id: ids
+        env:
+          IN_PKG: ${{ inputs.package_name }}
+          IN_NAME: ${{ inputs.app_name }}
+        run: |
+          set -eu
+          gen_seg() {
+            local n="$1" out="" i
+            local letters=abcdefghijklmnopqrstuvwxyz
+            for ((i = 0; i < n; i++)); do
+              out="$out${letters:RANDOM%26:1}"
+            done
+            printf '%s' "$out"
+          }
+
+          PKG="${IN_PKG:-}"
+          [ -n "$PKG" ] || PKG="com.$(gen_seg $((4 + RANDOM % 4))).$(gen_seg $((5 + RANDOM % 5)))"
+
+          NAME="${IN_NAME:-}"
+          [ -n "$NAME" ] || NAME="KernelSU"
+
+          echo "package_name=$PKG" >> "$GITHUB_OUTPUT"
+          echo "app_name=$NAME" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Spoofed manager build"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| application id | \`$PKG\` |"
+            echo "| app label | $NAME |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write signing key
+        id: signing
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -eu
+          if [ -n "${KEYSTORE:-}" ]; then
+            echo "$KEYSTORE" | base64 -d > key.jks
+            {
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=$KEY_ALIAS"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+              echo "KEYSTORE_FILE=key.jks"
+            } >> gradle.properties
+            echo "trusted=true" >> "$GITHUB_OUTPUT"
+            echo "Signing with repository KEYSTORE secret." >> "$GITHUB_STEP_SUMMARY"
+          else
+            TMP_PASS=$(openssl rand -hex 32)
+            keytool -genkeypair \
+              -alias spoof-key \
+              -keyalg RSA -keysize 2048 \
+              -validity 36500 \
+              -storepass "$TMP_PASS" \
+              -keypass "$TMP_PASS" \
+              -dname "CN=KernelSU Spoof Build" \
+              -storetype JKS \
+              -keystore key.jks
+            {
+              echo "KEYSTORE_PASSWORD=$TMP_PASS"
+              echo "KEY_ALIAS=spoof-key"
+              echo "KEY_PASSWORD=$TMP_PASS"
+              echo "KEYSTORE_FILE=key.jks"
+            } >> gradle.properties
+            echo "trusted=false" >> "$GITHUB_OUTPUT"
+            {
+              echo ""
+              echo "> **Warning:** no \`KEYSTORE\` secret — signed with a throwaway key."
+              echo "> Installable, but not recognized as the manager by a kernel that"
+              echo "> does not trust this certificate."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build manager APK
+        run: |
+          ./gradlew clean assembleRelease \
+            -PKSU_PACKAGE_NAME='${{ steps.ids.outputs.package_name }}' \
+            -PKSU_NAME='${{ steps.ids.outputs.app_name }}'
+
+      - name: Collect APK as manager.apk
+        run: |
+          set -eu
+          APK=$(find app/build/outputs/apk/release -type f -name "*.apk" | head -n 1)
+          test -n "$APK"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp -f "$APK" "$GITHUB_WORKSPACE/dist/manager.apk"
+          printf 'applicationId=%s\napp_name=%s\ntrusted_signing=%s\n' \
+            '${{ steps.ids.outputs.package_name }}' \
+            '${{ steps.ids.outputs.app_name }}' \
+            '${{ steps.signing.outputs.trusted }}' \
+            > "$GITHUB_WORKSPACE/dist/build-info.txt"
+
+      - name: Upload manager APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: manager-spoof-${{ steps.ids.outputs.package_name }}
+          path: |
+            dist/manager.apk
+            dist/build-info.txt
